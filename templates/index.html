@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Index</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      height: 100vh;
+      background-color: #f0f0f0;
+    }
+    #title {
+      font-size: 2em;
+      margin: 20px;
+      color: #333;
+    }
+    #messages {
+      width: 70%;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background-color: #ffffff;
+      border-radius: 10px;
+      box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+      overflow-y: auto;
+      height: 70vh; /* Adjusted to fit the export button */
+      font-family: monospace; /* Use a fixed-width font */
+    }
+    .message {
+      display: flex;
+      margin: 5px 0;
+    }
+    .timestamp {
+      width: 10%; /* At least 30% of the container width */
+      font-weight: bold;
+      padding-right: 10px; /* Space between timestamp and data */
+    }
+    .data {
+      width: 90%; /* Remaining width */
+    }
+    #export-button {
+      margin: 20px;
+      padding: 10px 20px;
+      font-size: 1em;
+      background-color: #007bff;
+      color: #ffffff;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+    }
+    #export-button:hover {
+      background-color: #0056b3;
+    }
+  </style>
+</head>
+<body>
+  <div id="title">Speech Service Real-Time</div>
+  <div id="messages"></div>
+  <button id="export-button">Export to PDF</button>
+
+  <script src="https://cdn.socket.io/4.4.1/socket.io.min.js" integrity="sha384-fKnu0iswBIqkjxrhQCTZ7qlLHOFEgNkRmK2vaO/LbTZSXdJfAu6ewRBdwHPhBo/H" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.4.0/jspdf.umd.min.js"></script>
+  <script type="text/javascript">
+    (() => {
+      const sock = io();
+      // debug connection
+      sock.on('connect', () => console.log('⚡️ socket connected'));
+      sock.on('disconnect', () => console.log('🛑 socket disconnected'));
+
+
+      const messagesContainer = document.getElementById('messages');
+      const exportButton = document.getElementById('export-button');
+  
+      sock.on('my_response', payload => {
+        console.log('🔊 recognized →', payload);
+        const ts = new Date().toLocaleTimeString();
+        const el = document.createElement('div');
+        el.classList.add('message');
+        el.innerHTML = `
+          <span class="timestamp">${ts}:</span>
+          <span class="data">${payload.data}</span>
+        `;
+        messagesContainer.appendChild(el);
+        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      });
+
+      sock.onAny((eventName, payload) => {
+        console.log("⚡️ Received event:", eventName, payload);
+      });
+  
+      exportButton.addEventListener('click', () => {
+        if (window.jspdf) {
+          const { jsPDF } = window.jspdf;
+          const pdf = new jsPDF();
+          const margin = 10;
+          const timestampWidth = 40; // Width for timestamp column in mm
+          const dataWidth = 140; // Width for data column in mm
+          const lineHeight = 10;
+          const pageWidth = pdf.internal.pageSize.width;
+          const pageHeight = pdf.internal.pageSize.height;
+  
+          const lines = Array.from(messagesContainer.children).map(child => {
+            const timestamp = child.querySelector('.timestamp').innerText;
+            const data = child.querySelector('.data').innerText;
+            return { timestamp, data };
+          });
+  
+          let y = margin;
+          for (const line of lines) {
+            const { timestamp, data } = line;
+  
+            // Add timestamp
+            pdf.text(timestamp, margin, y);
+            
+            // Add data
+            pdf.text(data, margin + timestampWidth, y, { maxWidth: dataWidth });
+  
+            y += lineHeight;
+  
+            // Check if need to add new page
+            if (y + lineHeight > pageHeight - margin) {
+              pdf.addPage();
+              y = margin;
+            }
+          }
+  
+          pdf.save('transcript.pdf');
+        } else {
+          console.error('jsPDF is not loaded');
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

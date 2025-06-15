@@ -1,63 +1,140 @@
 import os
-import threading
-import azure.cognitiveservices.speech as speechsdk
+import uuid
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from threading import Lock
 
 from dotenv import load_dotenv
 from flask import Flask, render_template
+from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, emit
-from flask_cors import CORS
 
-# import eventlet
-# eventlet.monkey_patch()
+import azure.cognitiveservices.speech as speechsdk
 
-# Load environment variables from .env file
+# -----------------------------------------------------------------------------
+# App & Config
+# -----------------------------------------------------------------------------
+app = Flask(__name__)
+app.config.from_object('config.Config')
+
+# -----------------------------------------------------------------------------
+# Extensions
+# -----------------------------------------------------------------------------
+db  = SQLAlchemy(app)
+sio = SocketIO(app, async_mode='threading')
+
+# -----------------------------------------------------------------------------
+# Model defined *after* db is initialized
+# -----------------------------------------------------------------------------
+class Transcript(db.Model):
+    __tablename__ = 'transcript'
+
+    id         = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.String(36), nullable=False, index=True)
+    text       = db.Column(db.Text, nullable=False)
+    timestamp  = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        index=True
+    )
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+handler = RotatingFileHandler(app.config['LOG_FILE'], maxBytes=10*1024*1024, backupCount=5)
+handler.setLevel(logging.INFO)
+handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s in %(module)s: %(message)s'))
+app.logger.addHandler(handler)
+
+# -----------------------------------------------------------------------------
+# Load .env & Azure creds
+# -----------------------------------------------------------------------------
 load_dotenv()
-
-SUBSCRIPTION_KEY = os.environ.get('SPEECH_KEY')
-SERVICE_REGION = os.environ.get('SPEECH_REGION')
+SUBSCRIPTION_KEY = os.getenv('SPEECH_KEY')
+SERVICE_REGION   = os.getenv('SPEECH_REGION')
 SERVICE_LANGUAGE = "id-ID"
 
-# Flask Service
-async_mode = None
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-CORS(app, resources={r"/*": {"origins": "*"}})
-socketio = SocketIO(app, async_mode='threading', cors_allowed_origins="*")
-# socketio = SocketIO(app, cors_allowed_origins="*")
+# -----------------------------------------------------------------------------
+# Ensure DB & tables exist
+# -----------------------------------------------------------------------------
+def ensure_database():
+    uri = app.config['SQLALCHEMY_DATABASE_URI']
+    if uri.startswith("sqlite:///"):
+        db_path = uri.replace("sqlite:///", "", 1)
+        if not os.path.exists(db_path):
+            app.logger.info(f"DB not found at {db_path}, creating…")
+        else:
+            app.logger.info(f"DB found at {db_path}, skipping creation")
+        db.create_all()
 
-def continuous_speech_recognition_with_intermediate_results():
+# -----------------------------------------------------------------------------
+# Speech → DB → SocketIO
+# -----------------------------------------------------------------------------
+thread      = None
+thread_lock = Lock()
+
+def speech_recognition_with_microphone():
     speech_config = speechsdk.SpeechConfig(subscription=SUBSCRIPTION_KEY, region=SERVICE_REGION)
     speech_config.speech_recognition_language = SERVICE_LANGUAGE
-    audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
-    speech_recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+    audio_config  = speechsdk.audio.AudioConfig(use_default_microphone=True)
+    recognizer    = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
 
-    def recognized_cb(evt):
-        print('RECOGNIZED: {}'.format(evt.result.text))
-        socketio.emit('recognized', {'text': evt.result.text}, broadcast=True)
+    result = recognizer.recognize_once()
+    if result.reason == speechsdk.ResultReason.RecognizedSpeech:
+        text = result.text.strip()
+        print(f"[{CURRENT_SESSION_ID}] Recognized: {text}")
+        app.logger.info(f"[{CURRENT_SESSION_ID}] Recognized: {text}")
 
-    def recognizing_cb(evt):
-        print('RECOGNIZING: {}'.format(evt.result.text))
-        socketio.emit('recognizing', {'text': evt.result.text}, broadcast=True)
+        # Save to db
+        with app.app_context():
+            rec = Transcript(
+                session_id=CURRENT_SESSION_ID,
+                text=text
+            )
+            db.session.add(rec)
+            db.session.commit()
 
-    speech_recognizer.recognized.connect(recognized_cb)
-    speech_recognizer.recognizing.connect(recognizing_cb)
+        sio.emit('my_response', {'data': text})
 
-    print("Say something...")
+    elif result.reason == speechsdk.ResultReason.NoMatch:
+        print(f"[{CURRENT_SESSION_ID}] No speech recognized")
+        app.logger.warning("No speech recognized")
+    else:
+        details = result.cancellation_details
+        msg = f"Canceled: {details.reason}"
+        if details.reason == speechsdk.CancellationReason.Error:
+            msg += f" ({details.error_details})"
+        app.logger.error(msg)
 
-    speech_recognizer.start_continuous_recognition()
-    input("Press Enter to stop...\n")
-    speech_recognizer.stop_continuous_recognition()
+def background_task():
+    sio.sleep(5)
+    while True:
+        sio.sleep(0.2)
+        speech_recognition_with_microphone()
+
+@sio.on('connect')
+def connect():
+    global thread
+    with thread_lock:
+        if thread is None:
+            thread = sio.start_background_task(background_task)
+    emit('my_response', {'data': 'connected'})
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
-def start_flask():
-    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
 
-if __name__ == "__main__":
-    # threading.Thread(target=continuous_speech_recognition_with_intermediate_results).start()
-    # start_flask()
+# one unique ID per “meeting session”
+CURRENT_SESSION_ID = str(uuid.uuid4())
+print("Starting new session:", CURRENT_SESSION_ID)
 
-    socketio.start_background_task(continuous_speech_recognition_with_intermediate_results)
-    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
+# -----------------------------------------------------------------------------
+# Start the app
+# -----------------------------------------------------------------------------
+if __name__ == '__main__':
+    with app.app_context():
+        ensure_database()
+
+    sio.run(app, host='0.0.0.0', port=5000)

@@ -1,0 +1,18 @@
+# Folders
+venv
+__pycache__
+
+# Env
+.env
+
+# Docs files
+# *.docx
+*.doc
+*.pdf
+
+# Audio files
+*.mp3
+*.wav
+
+# db files
+*.db
